@@ -12,6 +12,7 @@ Segments bacterial colonies/cells in transmitted light microscopy images using:
 import os
 import csv
 import glob
+import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter, distance_transform_edt, binary_fill_holes
 from skimage import io, filters, morphology, segmentation, measure, exposure
@@ -22,8 +23,10 @@ matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-INPUT_DIR = os.path.join(os.path.dirname(__file__), "HCS Images", "trans_files")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "HCS Images", "results_watershed")
+BASE_DIR = os.path.join(os.path.dirname(__file__), "HCS Images")
+TRANS_DIR = os.path.join(BASE_DIR, "trans_files")
+DAPI_DIR = BASE_DIR  # DAPI images are in the main HCS Images folder
+OUTPUT_DIR = os.path.join(BASE_DIR, "results_watershed")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -115,12 +118,66 @@ def segment_image(path):
     return overlay, count, gray
 
 
+def count_dapi(path):
+    """Count colonies in a DAPI fluorescence image (bright spots on black).
+    Uses watershed to split touching nuclei. Returns count only.
+    """
+    fname = os.path.basename(path)
+    mag = parse_magnification(fname)
+
+    # DAPI size bounds — nuclei are smaller/rounder than full cell bodies
+    if mag == "20x":
+        min_area, max_area = 100, 10000
+        min_dist = 20
+    else:
+        min_area, max_area = 30, 3000
+        min_dist = 10
+
+    # 1. Load and extract blue channel (DAPI signal) — use cv2 for robustness
+    img = cv2.imread(path)
+    if img is None:
+        return -1
+    blue = img[:, :, 0].astype(np.float64) / 255.0  # BGR format — index 0 is blue
+
+    # 2. Gaussian blur
+    smoothed = filters.gaussian(blue, sigma=1.5)
+
+    # 3. Otsu threshold
+    thresh_val = filters.threshold_otsu(smoothed)
+    if thresh_val < 0.02:
+        thresh_val = 0.05
+    binary = smoothed > thresh_val
+
+    # 4. Cleanup
+    binary = morphology.binary_opening(binary, morphology.disk(2))
+    binary = morphology.binary_closing(binary, morphology.disk(3))
+    binary = binary_fill_holes(binary)
+    binary = morphology.remove_small_objects(binary, min_size=min_area)
+
+    # 5. Watershed to split touching nuclei
+    dist = distance_transform_edt(binary)
+    dist_smooth = gaussian_filter(dist, sigma=2)
+    coords = peak_local_max(dist_smooth, min_distance=min_dist, labels=binary)
+    markers = np.zeros(binary.shape, dtype=np.int32)
+    for i, (r, c) in enumerate(coords):
+        markers[r, c] = i + 1
+    markers = morphology.dilation(markers, morphology.disk(2))
+    labels = watershed(-dist_smooth, markers, mask=binary)
+
+    # 6. Filter by area
+    props = measure.regionprops(labels)
+    count = sum(1 for r in props if min_area <= r.area <= max_area)
+
+    return count
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Gather all TRANS jpg files (case-insensitive)
-    patterns = [os.path.join(INPUT_DIR, "*.jpg"), os.path.join(INPUT_DIR, "*.JPG")]
+    # ── TRANS images (full segmentation with overlays) ─────────────────────
+    print("=== TRANS images (watershed) ===")
+    patterns = [os.path.join(TRANS_DIR, "*.jpg"), os.path.join(TRANS_DIR, "*.JPG")]
     paths = sorted(set(p for pat in patterns for p in glob.glob(pat)))
 
     results = []
@@ -132,7 +189,6 @@ def main():
 
         results.append((fname, mag, count))
 
-        # Save overlay using matplotlib (preserves float image correctly)
         out_name = fname.rsplit(".", 1)[0] + "_overlay.jpg"
         out_path = os.path.join(OUTPUT_DIR, out_name)
 
@@ -145,14 +201,41 @@ def main():
 
         print(f"  {fname}  mag={mag}  colonies={count}")
 
-    # Write CSV
     csv_path = os.path.join(OUTPUT_DIR, "colony_counts.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["filename", "magnification", "colony_count"])
         writer.writerows(results)
 
-    print(f"\nDone. {len(results)} images processed.")
+    print(f"\nTRANS done. {len(results)} images processed.")
+
+    # ── DAPI images (counts only) ─────────────────────────────────────────
+    print("\n=== DAPI images (counts only) ===")
+    dapi_patterns = [
+        os.path.join(DAPI_DIR, "*DAPI*.jpg"),
+        os.path.join(DAPI_DIR, "*DAPI*.JPG"),
+        os.path.join(DAPI_DIR, "*dapi*.jpg"),
+    ]
+    dapi_paths = sorted(set(p for pat in dapi_patterns for p in glob.glob(pat)))
+
+    dapi_results = []
+    for path in dapi_paths:
+        fname = os.path.basename(path)
+        mag = parse_magnification(fname)
+        count = count_dapi(path)
+        if count < 0:
+            print(f"  SKIP (could not read): {fname}")
+            continue
+        dapi_results.append((fname, mag, count))
+        print(f"  {fname}  mag={mag}  colonies={count}")
+
+    dapi_csv = os.path.join(OUTPUT_DIR, "dapi_colony_counts.csv")
+    with open(dapi_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "magnification", "colony_count"])
+        writer.writerows(dapi_results)
+
+    print(f"\nDAPI done. {len(dapi_results)} images processed.")
     print(f"Results saved to {OUTPUT_DIR}")
 
 

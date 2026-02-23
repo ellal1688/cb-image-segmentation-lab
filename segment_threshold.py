@@ -16,8 +16,10 @@ import cv2
 import numpy as np
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-INPUT_DIR = os.path.join(os.path.dirname(__file__), "HCS Images", "trans_files")
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "HCS Images", "results_threshold")
+BASE_DIR = os.path.join(os.path.dirname(__file__), "HCS Images")
+TRANS_DIR = os.path.join(BASE_DIR, "trans_files")
+DAPI_DIR = BASE_DIR  # DAPI images are in the main HCS Images folder
+OUTPUT_DIR = os.path.join(BASE_DIR, "results_threshold")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -100,12 +102,57 @@ def segment_image(path):
     return overlay, valid
 
 
+def count_dapi(path):
+    """Count colonies in a DAPI fluorescence image (bright spots on black).
+    Returns colony count only (no overlay).
+    """
+    fname = os.path.basename(path)
+    mag = parse_magnification(fname)
+
+    # DAPI size bounds — nuclei are smaller/rounder than full cell bodies
+    if mag == "20x":
+        min_area, max_area = 100, 10000
+    else:
+        min_area, max_area = 30, 3000
+
+    # 1. Load color and extract blue channel (DAPI signal)
+    img = cv2.imread(path)
+    if img is None:
+        return -1
+    blue = img[:, :, 0]  # BGR format — index 0 is blue
+
+    # 2. Gaussian blur to smooth noise
+    blurred = cv2.GaussianBlur(blue, (5, 5), 0)
+
+    # 3. Otsu's threshold — bright nuclei on dark background
+    thresh_val, binary = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    if thresh_val < 10:
+        _, binary = cv2.threshold(blurred, 15, 255, cv2.THRESH_BINARY)
+
+    # 4. Morphological open to remove noise, close to fill gaps
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    opened = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_open)
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel_close)
+
+    # 5. Find contours and filter by area
+    contours, _ = cv2.findContours(
+        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    valid = [c for c in contours if min_area <= cv2.contourArea(c) <= max_area]
+
+    return len(valid)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Gather all TRANS jpg files (case-insensitive)
-    patterns = [os.path.join(INPUT_DIR, "*.jpg"), os.path.join(INPUT_DIR, "*.JPG")]
+    # ── TRANS images (full segmentation with overlays) ─────────────────────
+    print("=== TRANS images (thresholding + contours) ===")
+    patterns = [os.path.join(TRANS_DIR, "*.jpg"), os.path.join(TRANS_DIR, "*.JPG")]
     paths = sorted(set(p for pat in patterns for p in glob.glob(pat)))
 
     results = []
@@ -120,19 +167,45 @@ def main():
         count = len(contours)
         results.append((fname, mag, count))
 
-        # Save overlay
         out_name = fname.rsplit(".", 1)[0] + "_overlay.jpg"
         cv2.imwrite(os.path.join(OUTPUT_DIR, out_name), overlay)
         print(f"  {fname}  mag={mag}  colonies={count}")
 
-    # Write CSV
     csv_path = os.path.join(OUTPUT_DIR, "colony_counts.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["filename", "magnification", "colony_count"])
         writer.writerows(results)
 
-    print(f"\nDone. {len(results)} images processed.")
+    print(f"\nTRANS done. {len(results)} images processed.")
+
+    # ── DAPI images (counts only) ─────────────────────────────────────────
+    print("\n=== DAPI images (counts only) ===")
+    dapi_patterns = [
+        os.path.join(DAPI_DIR, "*DAPI*.jpg"),
+        os.path.join(DAPI_DIR, "*DAPI*.JPG"),
+        os.path.join(DAPI_DIR, "*dapi*.jpg"),
+    ]
+    dapi_paths = sorted(set(p for pat in dapi_patterns for p in glob.glob(pat)))
+
+    dapi_results = []
+    for path in dapi_paths:
+        fname = os.path.basename(path)
+        mag = parse_magnification(fname)
+        count = count_dapi(path)
+        if count < 0:
+            print(f"  SKIP (could not read): {fname}")
+            continue
+        dapi_results.append((fname, mag, count))
+        print(f"  {fname}  mag={mag}  colonies={count}")
+
+    dapi_csv = os.path.join(OUTPUT_DIR, "dapi_colony_counts.csv")
+    with open(dapi_csv, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["filename", "magnification", "colony_count"])
+        writer.writerows(dapi_results)
+
+    print(f"\nDAPI done. {len(dapi_results)} images processed.")
     print(f"Results saved to {OUTPUT_DIR}")
 
 
